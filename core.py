@@ -1,5 +1,5 @@
-"""Fungsi inti aplikasi: baca data UTM, fitur model, rapikan(), dan plot gaya Origin.
-Harus identik dengan notebook pelatihan agar model memberi hasil yang sama."""
+"""Fungsi inti: baca data UTM, pipeline perapian kurva (smoothing, toe, patah), koreksi ML opsional, grafik.
+Fungsi fitur() harus identik dengan notebook pelatihan."""
 import io
 import re
 
@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
+from scipy.interpolate import make_smoothing_spline
 
 # ----------------------------------------------------------------------------- baca file
 X_KW = ['elong', 'extens', 'deflek', 'deflect', 'displace', 'perpanjang', 'pertambahan', 'strain',
@@ -117,6 +118,7 @@ def fitur(xr, yr, xq, win):
     return pd.DataFrame(F)
 
 
+# ----------------------------------------------------------------------------- pipeline perapian
 SATUAN_X = {'mm': 1.0, 'cm': 0.1, 'm': 1e-3, 'in': 1 / 25.4}
 SATUAN_Y = {'N': 1.0, 'kN': 1e-3, 'kgf': 1 / 9.80665, 'lbf': 0.224809}
 
@@ -126,78 +128,148 @@ def step_otomatis(rentang, n=200):
     return min([1, 2, 2.5, 5, 10], key=lambda m: abs(m * e - kasar)) * e
 
 
-def titik_patah(xr, yr, frac):
-    ys = savgol_filter(yr, max(5, (len(yr) // 25) | 1), 2) if len(yr) > 7 else yr
-    ip = int(np.argmax(ys)); turun = np.where(ys[ip:] < frac * ys[ip])[0]
-    return xr[ip + turun[0]] if len(turun) else xr[-1]
+def _grid_halus(xr, yr, n=1000):
+    g = np.linspace(xr[0], xr[-1], n)
+    gy = np.interp(g, xr, yr)
+    return g, savgol_filter(gy, max(7, (n // 60) | 1), 2)
 
 
-def rapikan(x_raw, y_raw, paket, step=None, mulai_nol=None, potong=True, potong_frac=None,
-            x_akhir=None, satuan_x='mm', satuan_y='N', desimal_x=None, desimal_y=None,
-            pakai_ml=True):
-    A = paket['aturan']
+def deteksi_patah(xr, yr, metode='otomatis', frac=0.4, drop=0.15):
+    """Kembalikan elongation tepat sebelum spesimen patah.
+    otomatis : beban jatuh > drop*puncak dalam jarak pendek (~1.5% rentang) setelah puncak
+    fraksi   : beban pertama kali < frac*puncak setelah puncak"""
+    if metode == 'tidak':
+        return xr[-1]
+    g, gy = _grid_halus(xr, yr)
+    ip = int(np.argmax(gy)); pk = gy[ip]
+    if metode == 'fraksi':
+        t = np.where(gy[ip:] < frac * pk)[0]
+        return g[ip + t[0]] if len(t) else xr[-1]
+    w = max(3, int(0.015 * len(g)))
+    for i in range(ip, len(g) - w):
+        if gy[i] - gy[i + w] > drop * pk:
+            return g[i]
+    t = np.where(gy[ip:] < 0.05 * pk)[0]
+    return g[ip + t[0]] if len(t) else xr[-1]
+
+
+def daerah_linear(xr, yr, lo=0.10, hi=0.60):
+    """Cari daerah elastis (kemiringan terbesar) sebelum puncak; kembalikan (m, c, x_awal, x_akhir)."""
+    g, gy = _grid_halus(xr, yr)
+    ip = int(np.argmax(gy)); pk = gy[ip]
+    d = np.gradient(gy, g)
+    ok = np.where((gy[:ip + 1] > lo * pk) & (gy[:ip + 1] < hi * pk))[0]
+    if len(ok) < 5:
+        return None
+    k = ok[np.argmax(d[ok])]
+    sel = ok[d[ok] >= 0.85 * d[k]]
+    sel = sel[(sel >= sel[sel <= k].min()) & (sel <= sel[sel >= k].max())]
+    xa, xb = g[sel[0]], g[sel[-1]]
+    m_ = (xr >= xa) & (xr <= xb)
+    if m_.sum() < 3:
+        return None
+    m, c = np.polyfit(xr[m_], yr[m_], 1)
+    return m, c, xa, xb
+
+
+def proses(x_raw, y_raw, awal='nol', patah='otomatis', frac=0.4, kehalusan=5, step='auto',
+           paket=None, pakai_ml=False):
+    """Pipeline perapian. Kembalikan (x_grid, y_grid, info) dalam satuan asli (mm, N)."""
     xr, yr = bersihkan(np.asarray(x_raw, float), np.asarray(y_raw, float))
-    if len(xr) < 5:
-        raise ValueError('data terlalu sedikit (< 5 titik)')
-    x0, sx, sy = norm_param(xr, yr)
-    mulai_nol = A.get('mulai_nol', True) if mulai_nol is None else mulai_nol
-    if step in (None, 'auto'):
-        s = A.get('step', 'auto')
-        step = step_otomatis(sx) if s in ('auto', None) or not A.get('interval_seragam', True) else float(s)
-    a = 0.0 if mulai_nol else xr[0]
-    b = xr[-1]
-    frac = potong_frac if potong_frac is not None else A.get('potong_frac')
-    if x_akhir:
-        b = x_akhir
-    elif potong and frac:
-        b = titik_patah(xr, yr, frac)
-    xq = np.arange(a, b + step * 0.5, step)
-    F = fitur((xr - x0) / sx, yr / sy, (xq - x0) / sx, paket['win'])[paket['kolom']]
-    koreksi = paket['model'].predict(F) if pakai_ml else 0.0
-    yq = (F['interp'].to_numpy() + koreksi) * sy
-    if mulai_nol and abs(xq[0]) < 1e-12:
-        yq[0] = 0.0
-    dx = A.get('desimal_x', 3) if desimal_x is None else desimal_x
-    dy = A.get('desimal_y', 2) if desimal_y is None else desimal_y
-    xq = xq * SATUAN_X[satuan_x]; yq = yq * SATUAN_Y[satuan_y]
-    return pd.DataFrame({f'Elongation ({satuan_x})': np.round(xq, dx),
-                         f'Force ({satuan_y})': np.round(yq, dy)})
+    if len(xr) < 8:
+        raise ValueError('data terlalu sedikit (< 8 titik)')
+    info = {'F_maks_mentah': float(yr.max())}
+    # 1. potong saat patah
+    xe = deteksi_patah(xr, yr, patah, frac)
+    m_ = xr <= xe
+    if m_.sum() >= 8:
+        xr, yr = xr[m_], yr[m_]
+    info['x_patah_asli'] = float(xr[-1])
+    # 2. awal kurva
+    lin = daerah_linear(xr, yr)
+    info['kekakuan'] = float(lin[0]) if lin else np.nan
+    geser = 0.0
+    if awal == 'toe' and lin:
+        m, c, xa, _ = lin
+        x0 = -c / m                                     # perpotongan garis elastis dengan F = 0
+        keep = xr >= xa
+        xr = np.r_[x0, xr[keep]]; yr = np.r_[0.0, yr[keep]]
+        geser = x0; xr = xr - x0
+    elif awal == 'nol':
+        # buang daerah 'toe' (beban kecil yang datar/bergelombang di awal), lalu tarik dari (0,0)
+        xa = lin[2] if lin else 0.0
+        keep = xr >= xa if xa > 0 else xr > 0
+        xr = np.r_[0.0, xr[keep]]; yr = np.r_[0.0, yr[keep]]
+    info['geser_toe'] = float(geser)
+    # 3. grid keluaran
+    rentang = xr[-1] - xr[0]
+    st = step_otomatis(rentang) if step in (None, 'auto') else float(step)
+    xg = np.arange(xr[0], xr[-1] + st * 0.01, st)
+    if xg[-1] < xr[-1] - 1e-9:
+        xg = np.r_[xg, xr[-1]]
+    # 4. smoothing spline (GCV) - kehalusan 0..10, 5 = otomatis
+    w = np.ones_like(xr)
+    if awal in ('nol', 'toe'):
+        w[0] = 1e4                                       # paksa lewat (0,0)
+    # x & y dinormalisasi ke [0,1] supaya skala lambda sama untuk semua data
+    x0s, sxs = xr[0], (xr[-1] - xr[0]) or 1.0; sys_ = np.abs(yr).max() or 1.0
+    lam = 10 ** (-7.5 + 0.5 * kehalusan)
+    try:
+        sp = make_smoothing_spline((xr - x0s) / sxs, yr / sys_, w=w, lam=lam)
+        yg = sp((xg - x0s) / sxs) * sys_
+    except Exception:
+        yg = savgol_filter(np.interp(xg, xr, yr), max(5, (len(xg) // 15) | 1), 2)
+    # 5. koreksi ML (opsional) + dihaluskan lagi
+    if pakai_ml and paket is not None:
+        x0n, sx, sy = norm_param(xr, yr)
+        F = fitur((xr - x0n) / sx, yr / sy, (xg - x0n) / sx, paket['win'])[paket['kolom']]
+        kor = paket['model'].predict(F) * sy
+        kor = savgol_filter(kor, max(5, (len(kor) // 10) | 1), 2) if len(kor) > 7 else kor
+        yg = yg + kor
+    if awal in ('nol', 'toe'):
+        yg[0] = 0.0
+    yg = np.maximum(yg, 0) if yr.min() >= 0 else yg
+    ip = int(np.argmax(yg))
+    info.update(F_maks=float(yg[ip]), x_F_maks=float(xg[ip]), x_patah=float(xg[-1]),
+                energi=float(np.trapezoid(yg, xg) / 1000 if hasattr(np, 'trapezoid') else np.trapz(yg, xg) / 1000),
+                selisih_F_maks=float((yg[ip] - info['F_maks_mentah']) / info['F_maks_mentah'] * 100),
+                step=float(st))
+    return xg, yg, info
 
 
-def ringkasan(df):
-    x, y = df.iloc[:, 0].to_numpy(), df.iloc[:, 1].to_numpy()
-    ip = int(np.argmax(y))
-    return {'F maks': y[ip], 'Elongation saat F maks': x[ip], 'Elongation akhir': x[-1], 'Jumlah titik': len(df)}
+def ke_tabel(xg, yg, satuan_x='mm', satuan_y='N', desimal_x=3, desimal_y=2, tegangan=None):
+    """tegangan: None atau dict(A0=mm2, L0=mm) -> keluaran Stress (MPa) - Strain (%)."""
+    if tegangan:
+        return pd.DataFrame({'Strain (%)': np.round(xg / tegangan['L0'] * 100, desimal_x),
+                             'Stress (MPa)': np.round(yg / tegangan['A0'], desimal_y)})
+    return pd.DataFrame({f'Elongation ({satuan_x})': np.round(xg * SATUAN_X[satuan_x], desimal_x),
+                         f'Force ({satuan_y})': np.round(yg * SATUAN_Y[satuan_y], desimal_y)})
 
 
-# ----------------------------------------------------------------------------- grafik
-WARNA = ['#C00000', '#1F4E79', '#2E7D32', '#E07B00', '#6A1B9A', '#00838F', '#5D4037', '#AD1457']
+# ----------------------------------------------------------------------------- grafik ekspor (gaya Origin)
+WARNA = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948']
 
 
-def _gaya_origin(ax):
-    for s in ax.spines.values():
-        s.set_linewidth(1.5)
-    ax.tick_params(direction='in', width=1.5, length=6, top=True, right=True, labelsize=11)
-    ax.minorticks_on()
-    ax.tick_params(which='minor', direction='in', length=3, top=True, right=True)
-
-
-def plot_origin(seri, judul='', tampil_mentah=True, dpi=110):
-    """seri: list of dict(nama, df, x_raw, y_raw)."""
+def plot_origin(seri, judul='', tampil_mentah=False, dpi=110, warna_tunggal='#C00000'):
+    """seri: list of dict(nama, df, x_raw, y_raw). Satu spesimen -> satu garis tegas."""
     plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 12})
     fig, ax = plt.subplots(figsize=(6.5, 5), dpi=dpi)
     for i, s in enumerate(seri):
-        c = WARNA[i % len(WARNA)]
+        c = warna_tunggal if len(seri) == 1 else WARNA[i % len(WARNA)]
         if tampil_mentah and s.get('x_raw') is not None:
-            ax.scatter(s['x_raw'], s['y_raw'], s=9, facecolors='none', edgecolors=c, alpha=.35, lw=.8)
-        ax.plot(s['df'].iloc[:, 0], s['df'].iloc[:, 1], c=c, lw=2, label=s['nama'])
+            ax.scatter(s['x_raw'], s['y_raw'], s=6, color='0.65', alpha=.5, lw=0, zorder=1)
+        ax.plot(s['df'].iloc[:, 0], s['df'].iloc[:, 1], c=c, lw=2, label=s['nama'], zorder=3)
     df0 = seri[0]['df']
     ax.set_xlabel(df0.columns[0], fontweight='bold'); ax.set_ylabel(df0.columns[1], fontweight='bold')
     if judul:
         ax.set_title(judul, fontweight='bold')
-    _gaya_origin(ax)
+    for sp in ax.spines.values():
+        sp.set_linewidth(1.5)
+    ax.tick_params(direction='in', width=1.5, length=6, top=True, right=True, labelsize=11)
+    ax.minorticks_on(); ax.tick_params(which='minor', direction='in', length=3, top=True, right=True)
     ax.set_xlim(left=0); ax.set_ylim(bottom=0)
-    ax.legend(frameon=False, fontsize=10)
+    if len(seri) > 1:
+        ax.legend(frameon=False, fontsize=10)
     fig.tight_layout()
     return fig
 

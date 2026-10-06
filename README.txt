@@ -3,12 +3,22 @@ AUTOMERIS ML - APLIKASI PERAPIAN DATA UJI BENDING
 
 ISI FOLDER
   app.py                 -> tampilan aplikasi (Streamlit)
-  core.py                -> fungsi model (sama dengan notebook pelatihan)
+  core.py                -> pengolahan kurva (smoothing, toe, titik patah) + koreksi ML
+  digitizer.py           -> digitasi gambar grafik (deteksi sumbu, OCR, ekstraksi kurva)
+  themes.py              -> 3 pilihan desain dashboard (Korporat / Industri / Minimal)
+  packages.txt           -> tesseract-ocr (dipasang otomatis di Streamlit Cloud)
   requirements.txt       -> daftar library
   Jalankan_Aplikasi.bat  -> klik 2x untuk membuka aplikasi (Windows)
   model/                 -> taruh model_automeris_bending.joblib di sini
 
-LANGKAH 1 - Ambil model dari Colab
+CATATAN: model ML sekarang OPSIONAL. Tanpa model, aplikasi tetap jalan dengan smoothing presisi.
+
+OCR UNTUK DIGITASI GAMBAR
+  Streamlit Cloud : otomatis (packages.txt)
+  Windows lokal   : instal Tesseract dari https://github.com/UB-Mannheim/tesseract/wiki
+                    (tanpa Tesseract, batas sumbu diisi manual - digitasi tetap jalan)
+
+LANGKAH 1 - Ambil model dari Colab (opsional)
   Di notebook, setelah bagian 8 selesai, jalankan sel ini:
       from google.colab import files
       files.download('/content/hasil_ml_automeris/model_automeris_bending.joblib')
