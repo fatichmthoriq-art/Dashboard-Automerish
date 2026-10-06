@@ -1,0 +1,2 @@
+Taruh file model_automeris_bending.joblib (hasil notebook Colab) di folder ini.
+Aplikasi akan memuatnya otomatis saat dibuka.
